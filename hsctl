@@ -1,0 +1,469 @@
+#!/bin/sh
+# hsctl: drive Headscale from any device, without SSH to the server.
+#
+# Two credentials, two backends:
+#   mint  scoped token for the Friday mint sidecar ($HS_URL/friday/mesh). It can
+#         only mint short-lived keys (1h-7d), register nodes and list nodes, so
+#         it is the one to copy onto every device. Same backend as Telegram /mesh.
+#   api   full Headscale API key for $HS_URL/api/v1. Adds 90d keys, other users,
+#         ephemeral/tagged keys, key list/expire and user list. Keep it on few
+#         machines: it can also delete nodes and rewrite ACL policy.
+# With both saved the API key is used; HSCTL_BACKEND=mint|api forces one.
+#
+#   hsctl login --mint | login
+#   hsctl preauthkeys create [--user asik] [--reusable] [--expiration 7d]
+#   hsctl register hskey-authreq-...   (approve a node waiting at the login page)
+#   hsctl nodes list
+#   hsctl preauthkeys list | expire ID ; hsctl users list    (API key only)
+#
+# Needs only POSIX sh + curl: macOS, Linux, OpenWrt/BusyBox, Termux. jq or
+# python3, if present, only improve output.
+#
+# Env: HS_URL, HEADSCALE_MINT_URL, HS_USER, HEADSCALE_API_KEY and
+# HEADSCALE_MINT_TOKEN (override the files in ${XDG_CONFIG_HOME:-~/.config}/hsctl).
+
+set -u
+umask 077
+
+HS_URL="${HS_URL:-https://hs.asikmydeen.com}"
+HS_URL="${HS_URL%/}"
+MINT_URL="${HEADSCALE_MINT_URL:-$HS_URL/friday/mesh}"
+MINT_URL="${MINT_URL%/}"
+# The sidecar registers every node and mints every key as this user.
+MINT_USER="${HS_MINT_USER:-asik}"
+MINT_EXPIRATIONS="1h 8h 24h 48h 7d"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hsctl"
+KEY_FILE="$CONF_DIR/apikey"
+MINT_FILE="$CONF_DIR/minttoken"
+
+usage() {
+	cat >&2 <<'EOF'
+usage: hsctl <command>
+
+  login --mint                  save the scoped mint token (recommended, every device)
+  login                         save a full Headscale API key (admin machines only)
+  preauthkeys create [flags]    print a new pre-auth key on stdout
+      -u, --user NAME|ID        owner (mint: asik only; default $HS_USER)
+      --reusable                allow more than one registration
+      -e, --expiration DUR      lifetime (default 1h). mint: 1h 8h 24h 48h 7d
+                                api: any of 30m 12h 90d 2w ...
+      --ephemeral               api only: node is removed when offline
+      --tags tag:a,tag:b        api only: ACL tags for registered nodes
+  register TEXT                 approve a node; TEXT contains hskey-authreq-...
+  nodes list                    list nodes
+  preauthkeys list              api only
+  preauthkeys expire ID         api only
+  users list                    api only
+
+Mint token: NAS secrets/headscale/mint.env (HEADSCALE_MINT_TOKEN).
+API key: on the server, `headscale apikeys create --expiration 365d`.
+EOF
+	exit 2
+}
+
+die() {
+	echo "hsctl: $*" >&2
+	exit 1
+}
+
+have_api_key() { [ -n "${HEADSCALE_API_KEY:-}" ] || [ -s "$KEY_FILE" ]; }
+have_mint_token() { [ -n "${HEADSCALE_MINT_TOKEN:-}" ] || [ -s "$MINT_FILE" ]; }
+
+backend() {
+	case "${HSCTL_BACKEND:-}" in
+	api | mint) printf '%s' "$HSCTL_BACKEND" ;;
+	'')
+		if have_api_key; then
+			printf api
+		elif have_mint_token; then
+			printf mint
+		else
+			die "no credentials; run 'hsctl login --mint' (scoped mint token) or 'hsctl login' (full API key)"
+		fi
+		;;
+	*) die "HSCTL_BACKEND must be 'api' or 'mint', not '$HSCTL_BACKEND'" ;;
+	esac
+}
+
+api_key() {
+	if [ -n "${HEADSCALE_API_KEY:-}" ]; then
+		printf '%s' "$HEADSCALE_API_KEY"
+	elif [ -s "$KEY_FILE" ]; then
+		tr -d '\r\n' < "$KEY_FILE"
+	else
+		die "no API key; run 'hsctl login' (or set HEADSCALE_API_KEY)"
+	fi
+}
+
+mint_token() {
+	if [ -n "${HEADSCALE_MINT_TOKEN:-}" ]; then
+		printf '%s' "$HEADSCALE_MINT_TOKEN"
+	elif [ -s "$MINT_FILE" ]; then
+		tr -d '\r\n' < "$MINT_FILE"
+	else
+		die "no mint token; run 'hsctl login --mint' (or set HEADSCALE_MINT_TOKEN)"
+	fi
+}
+
+# request METHOD URL TOKEN LOGIN_CMD [JSON_BODY]: response body on stdout,
+# non-2xx is fatal. The bearer token reaches curl through a config on stdin,
+# never through argv, so it stays out of ps output and shell history.
+request() {
+	method="$1" url="$2" token="$3" login_cmd="$4" body="${5:-}"
+	# The token is spliced into a curl config line, where a newline would start
+	# a new directive (url/output/upload-file can write or exfiltrate files) and
+	# a quote ends the value. Real tokens are base64/hex/hskey-api-..., nothing else.
+	case "$token" in
+	'' | *[!A-Za-z0-9._~+/=-]*) die "credential has unexpected characters; re-run '$login_cmd'" ;;
+	esac
+	# Only https, or loopback for local testing. 100.64.0.0/10 is not exempt:
+	# with Tailscale down that range is carrier CGNAT or a captive portal.
+	case "$url" in
+	https://* | http://127.0.0.1[:/]* | http://localhost[:/]* | http://\[::1\][:/]*) ;;
+	*) [ "${HSCTL_ALLOW_HTTP:-}" = 1 ] \
+		|| die "refusing to send a credential to non-https $url (HSCTL_ALLOW_HTTP=1 overrides)" ;;
+	esac
+	resp="$(mktemp)" || die "mktemp failed"
+	# A minted key sits in this file until it is printed. Cleanup lives on EXIT;
+	# the signal traps only exit, since a trapped INT would otherwise resume.
+	trap 'rm -f "$resp"' EXIT
+	trap 'exit 130' INT TERM HUP
+	set -- -sS --max-time 20 -X "$method" -o "$resp" -w '%{http_code}' \
+		-H 'Accept: application/json' -K - "$url"
+	[ -n "$body" ] && set -- -H 'Content-Type: application/json' --data-binary "$body" "$@"
+	# -q must be curl's first argument: it skips ~/.curlrc, where trace-ascii
+	# would log the token and "insecure" would turn off TLS verification.
+	code="$(printf 'header = "Authorization: Bearer %s"\n' "$token" | curl -q "$@")"
+	rc=$?
+	if [ $rc -ne 0 ]; then
+		rm -f "$resp"
+		die "cannot reach $url (curl exit $rc)"
+	fi
+	case "$code" in
+	2??)
+		cat "$resp"
+		rm -f "$resp"
+		;;
+	*)
+		# Headscale errors carry "message"; the mint sidecar uses "error".
+		msg="$(json_str message < "$resp" | sanitize)"
+		[ -n "$msg" ] || msg="$(json_str error < "$resp" | sanitize)"
+		rm -f "$resp"
+		[ "$code" = 401 ] && msg="${msg:-unauthorized}; credential missing, wrong or expired, run '$login_cmd'"
+		die "HTTP $code from $method $url: ${msg:-no details}"
+		;;
+	esac
+}
+
+api() {
+	tok="$(api_key)" || exit 1
+	request "$1" "$HS_URL$2" "$tok" "hsctl login" "${3:-}"
+}
+
+mint() {
+	tok="$(mint_token)" || exit 1
+	request "$1" "$MINT_URL/$2" "$tok" "hsctl login --mint" "${3:-}"
+}
+
+# json_str FIELD: string value of FIELD in compact-or-spaced JSON on stdin.
+# The sed is greedy, so with repeated fields it returns the LAST one; only use
+# it where the field is unique (count_field guards the user lookup).
+json_str() {
+	tr -d '\n' | sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+count_field() {
+	tr -d '\n' | grep -o '"'"$1"'"[[:space:]]*:' | wc -l | tr -d ' '
+}
+
+# json_text FIELD: fully decoded string FIELD (escapes and all) from stdin.
+# The sed fallback is for jq/python-less systems like OpenWrt; it assumes FIELD
+# is the last member of the top-level object, which holds for the mint's
+# {"ok": ..., "text": ...}.
+json_text() {
+	if command -v jq >/dev/null 2>&1; then
+		jq -r --arg f "$1" '.[$f] // empty'
+	elif command -v python3 >/dev/null 2>&1; then
+		python3 -I -c 'import json, sys; print(json.load(sys.stdin).get(sys.argv[1]) or "")' "$1"
+	else
+		nl="$(printf '\nx')"
+		nl="${nl%x}"
+		esc="$(printf '\033')"
+		# Escaped backslashes are parked on a control byte first so "\\n" is not
+		# decoded as a newline. \xNN in sed is GNU-only, hence the real byte.
+		ph="$(printf '\001')"
+		# Other \uXXXX (any non-ASCII, from json.dumps' ensure_ascii) cannot be
+		# turned into UTF-8 in portable sed; show them as an unambiguous [U+XXXX].
+		tr -d '\n' | sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\(.*\)"[[:space:]]*}[[:space:]]*$/\1/p' \
+			| sed -e "s/\\\\\\\\/$ph/g" -e 's/\\"/"/g' -e 's/\\t/	/g' \
+				-e "s/\\\\u001[bB]/$esc/g" -e 's/\\u\([0-9A-Fa-f]\{4\}\)/[U+\1]/g' \
+				-e 's/\\n/\'"$nl"'/g' -e "s/$ph/\\\\/g"
+		echo
+	fi
+}
+
+# sanitize: make server-controlled text safe to print. Colour codes are
+# dropped whole for readability; every other control byte except tab and
+# newline goes too, so OSC 52 (clipboard write), title sets and screen clears
+# from a node-reported hostname cannot reach the terminal. Run it on DECODED
+# text: before decoding, ESC is still the six characters \u001b.
+sanitize() {
+	sed "s/$(printf '\033')\[[0-9;]*m//g" | LC_ALL=C tr -d '\000-\010\013-\037\177'
+}
+
+# to_rfc3339 DURATION: absolute UTC timestamp DURATION from now.
+to_rfc3339() {
+	n="${1%[smhdw]}"
+	unit="${1#"$n"}"
+	case "$n" in '' | *[!0-9]*) die "invalid duration '$1' (use e.g. 30m, 12h, 90d, 2w)" ;; esac
+	case "$unit" in
+	s) mult=1 ;; m) mult=60 ;; h) mult=3600 ;; d) mult=86400 ;; w) mult=604800 ;;
+	*) die "invalid duration '$1' (needs a unit: s m h d w)" ;;
+	esac
+	t=$(($(date +%s) + n * mult))
+	# GNU and BusyBox date take -d @epoch; BSD/macOS date takes -r epoch.
+	date -u -d "@$t" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+		|| date -u -r "$t" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+		|| die "this system's date cannot format timestamps"
+}
+
+# resolve_user NAME|ID: numeric user id (api backend).
+resolve_user() {
+	case "$1" in
+	'') die "no user; pass --user NAME or set HS_USER" ;;
+	*[!0-9]*) ;;
+	*) printf '%s' "$1"; return ;;
+	esac
+	case "$1" in *[!A-Za-z0-9._@-]*) die "invalid user name '$1'" ;; esac
+	name_q="$(printf '%s' "$1" | sed 's/@/%40/g')"
+	resp="$(api GET "/api/v1/user?name=$name_q")" || exit 1
+	n="$(printf '%s' "$resp" | count_field id)"
+	[ "$n" = 1 ] || die "user '$1' not found (matched $n users)"
+	got="$(printf '%s' "$resp" | json_str name)"
+	[ "$got" = "$1" ] || die "user lookup for '$1' returned '$(printf '%s' "$got" | sanitize)'"
+	printf '%s' "$resp" | json_str id
+}
+
+# table ARRAY_FIELD COLUMNS...: pretty-print a JSON list from stdin.
+# Columns are dotted paths; list values are comma-joined. Raw JSON without jq/python3.
+table() {
+	field="$1"
+	shift
+	if command -v jq >/dev/null 2>&1; then
+		cols=""
+		for c in "$@"; do
+			cols="$cols${cols:+, }(.$c | if type == \"array\" then join(\",\") else (. // \"\" | tostring) end)"
+		done
+		rows="$(printf '%s\n' "$*" | tr ' ' '\t'; jq -r ".${field}[]? | [$cols] | @tsv")" || exit 1
+		# Sanitise before column so alignment is computed on what is printed.
+		rows="$(printf '%s\n' "$rows" | sanitize)"
+		if command -v column >/dev/null 2>&1; then
+			printf '%s\n' "$rows" | column -t -s "$(printf '\t')"
+		else
+			printf '%s\n' "$rows"
+		fi
+	elif command -v python3 >/dev/null 2>&1; then
+		# Captured first so a python failure is not hidden by the sanitize pipe.
+		rows="$(python3 -I -c '
+import json, sys
+field, cols = sys.argv[1], sys.argv[2:]
+def get(o, path):
+    for p in path.split("."):
+        o = o.get(p) if isinstance(o, dict) else None
+    if isinstance(o, list):
+        return ",".join(map(str, o))
+    return "" if o is None else str(o).lower() if isinstance(o, bool) else str(o)
+rows = [cols] + [[get(r, c) for c in cols] for r in json.load(sys.stdin).get(field) or []]
+w = [max(len(r[i]) for r in rows) for i in range(len(cols))]
+for r in rows:
+    print("  ".join(v.ljust(w[i]) for i, v in enumerate(r)).rstrip())
+' "$field" "$@")" || exit 1
+		printf '%s\n' "$rows" | sanitize
+	else
+		sanitize
+		echo
+	fi
+}
+
+# list PATH FIELD COLUMNS...: fetch first so an API error fails the command
+# instead of being swallowed by the pipe into table.
+list() {
+	path="$1"
+	shift
+	resp="$(api GET "$path")" || exit 1
+	printf '%s' "$resp" | table "$@"
+}
+
+# require_api WHAT: refuse API-only commands on the mint backend.
+require_api() {
+	be="$(backend)" || exit 1
+	[ "$be" = api ] && return 0
+	die "'$1' needs a full API key ('hsctl login'); the mint token can only mint keys, register nodes and list nodes"
+}
+
+cmd_login() {
+	kind=api
+	case "${1:-}" in
+	'') ;;
+	--mint) kind=mint ;;
+	*) usage ;;
+	esac
+	if [ "$kind" = mint ]; then
+		prompt="Mint token for $MINT_URL"
+		file="$MINT_FILE"
+	else
+		prompt="Headscale API key for $HS_URL"
+		file="$KEY_FILE"
+	fi
+	if [ -t 0 ]; then
+		# Restore the saved tty state on any exit, so Ctrl-C at the prompt does
+		# not leave the user's terminal with echo off.
+		saved_tty="$(stty -g 2>/dev/null)"
+		trap '[ -n "$saved_tty" ] && stty "$saved_tty" 2>/dev/null' EXIT
+		trap 'echo >&2; exit 130' INT TERM HUP
+		printf '%s: ' "$prompt" >&2
+		stty -echo 2>/dev/null
+		IFS= read -r secret
+		stty "$saved_tty" 2>/dev/null
+		trap - EXIT INT TERM HUP
+		echo >&2
+	else
+		IFS= read -r secret
+	fi
+	secret="$(printf '%s' "$secret" | tr -d '\r\n ')"
+	[ -n "$secret" ] || die "empty credential"
+	if [ "$kind" = mint ]; then
+		request GET "$MINT_URL/nodes" "$secret" "hsctl login --mint" >/dev/null || exit 1
+	else
+		request GET "$HS_URL/api/v1/user" "$secret" "hsctl login" >/dev/null || exit 1
+	fi
+	mkdir -p "$CONF_DIR"
+	tmp="$file.tmp.$$"
+	printf '%s\n' "$secret" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$file" \
+		|| { rm -f "$tmp"; die "could not write $file"; }
+	echo "hsctl: verified and saved to $file" >&2
+}
+
+cmd_preauthkeys_create() {
+	user="${HS_USER:-}" reusable=false ephemeral=false expiration=1h tags=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-u | --user) [ $# -ge 2 ] || usage; user="$2"; shift ;;
+		--user=*) user="${1#*=}" ;;
+		-e | --expiration) [ $# -ge 2 ] || usage; expiration="$2"; shift ;;
+		--expiration=*) expiration="${1#*=}" ;;
+		--reusable) reusable=true ;;
+		--ephemeral) ephemeral=true ;;
+		--tags) [ $# -ge 2 ] || usage; tags="$2"; shift ;;
+		--tags=*) tags="${1#*=}" ;;
+		*) usage ;;
+		esac
+		shift
+	done
+	be="$(backend)" || exit 1
+	if [ "$be" = mint ]; then
+		create_via_mint
+	else
+		create_via_api
+	fi
+}
+
+create_via_mint() {
+	# Check everything the sidecar cannot honour before making a request.
+	[ "$ephemeral" = false ] || die "--ephemeral needs a full API key ('hsctl login')"
+	[ -z "$tags" ] || die "--tags needs a full API key ('hsctl login')"
+	[ -z "$user" ] || [ "$user" = "$MINT_USER" ] \
+		|| die "the mint only issues keys for user '$MINT_USER'; other users need a full API key ('hsctl login')"
+	case " $MINT_EXPIRATIONS " in
+	*" $expiration "*) ;;
+	*) die "the mint allows --expiration $MINT_EXPIRATIONS; longer or custom lifetimes need a full API key ('hsctl login')" ;;
+	esac
+	resp="$(mint POST preauth "{\"expiration\":\"$expiration\",\"reusable\":$reusable}")" || exit 1
+	key="$(printf '%s' "$resp" | json_str key)"
+	[ -n "$key" ] || die "mint response had no key"
+	printf '%s\n' "$key"
+	echo "hsctl: user $MINT_USER, reusable=$reusable, expires in $expiration (mint)" >&2
+}
+
+create_via_api() {
+	exp_ts="$(to_rfc3339 "$expiration")" || exit 1
+	tags_json=""
+	if [ -n "$tags" ]; then
+		old_ifs="$IFS"
+		IFS=,
+		for t in $tags; do
+			case "$t" in tag:*) ;; *) die "tag '$t' must start with 'tag:'" ;; esac
+			case "${t#tag:}" in '' | *[!A-Za-z0-9._-]*) die "invalid tag '$t'" ;; esac
+			tags_json="$tags_json${tags_json:+,}\"$t\""
+		done
+		IFS="$old_ifs"
+	fi
+	uid="$(resolve_user "$user")" || exit 1
+	body="{\"user\":\"$uid\",\"reusable\":$reusable,\"ephemeral\":$ephemeral,\"expiration\":\"$exp_ts\",\"aclTags\":[$tags_json]}"
+	resp="$(api POST /api/v1/preauthkey "$body")" || exit 1
+	key="$(printf '%s' "$resp" | json_str key)"
+	[ -n "$key" ] || die "server response had no key"
+	printf '%s\n' "$key"
+	echo "hsctl: user $user, reusable=$reusable, ephemeral=$ephemeral, expires $exp_ts" >&2
+}
+
+cmd_preauthkeys_expire() {
+	[ $# -eq 1 ] || usage
+	case "$1" in '' | *[!0-9]*) die "key id must be numeric (see 'hsctl preauthkeys list')" ;; esac
+	api POST /api/v1/preauthkey/expire "{\"id\":\"$1\"}" >/dev/null || exit 1
+	echo "hsctl: pre-auth key $1 expired" >&2
+}
+
+# register TEXT...: TEXT may be the bare id or the whole command the Tailscale
+# login page shows. Always goes through the mint, which approves as $MINT_USER.
+cmd_register() {
+	[ $# -ge 1 ] || usage
+	id="$(printf '%s\n' "$*" | grep -oE '[Hh][Ss][Kk][Ee][UuYy]-[Aa][Uu][Tt][Hh][Rr][Ee][Qq]-[A-Za-z0-9_-]+' | head -n 1)"
+	[ -n "$id" ] || die "no hskey-authreq-... id in '$*'"
+	id="hskey-${id#?????-}"
+	mint POST register "{\"auth_id\":\"$id\"}" >/dev/null || exit 1
+	echo "hsctl: registered $id as $MINT_USER; it should come online in a few seconds" >&2
+}
+
+cmd_nodes_list() {
+	be="$(backend)" || exit 1
+	if [ "$be" = api ]; then
+		list /api/v1/node nodes id givenName user.name ipAddresses online approvedRoutes
+		return
+	fi
+	resp="$(mint GET nodes)" || exit 1
+	text="$(printf '%s' "$resp" | json_text text)" || exit 1
+	printf '%s\n' "$text" | sanitize
+}
+
+case "${1:-}" in
+login) shift; cmd_login "$@" ;;
+register) shift; cmd_register "$@" ;;
+preauthkeys | preauthkey)
+	shift
+	case "${1:-}" in
+	create) shift; cmd_preauthkeys_create "$@" ;;
+	list | ls)
+		require_api "preauthkeys list"
+		list /api/v1/preauthkey preAuthKeys id user.name reusable ephemeral used expiration aclTags
+		;;
+	expire) shift; require_api "preauthkeys expire"; cmd_preauthkeys_expire "$@" ;;
+	*) usage ;;
+	esac
+	;;
+nodes | node)
+	shift
+	case "${1:-}" in
+	list | ls) cmd_nodes_list ;;
+	*) usage ;;
+	esac
+	;;
+users | user)
+	shift
+	case "${1:-}" in
+	list | ls) require_api "users list"; list /api/v1/user users id name displayName ;;
+	*) usage ;;
+	esac
+	;;
+*) usage ;;
+esac
