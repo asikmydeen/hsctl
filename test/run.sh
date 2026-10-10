@@ -25,6 +25,10 @@ export XDG_CONFIG_HOME="$TMP/config"
 unset HEADSCALE_API_KEY HS_USER 2>/dev/null || true
 
 pass=0 fail=0
+# Decide modes from what hsctl can actually see, not from whether HSCTL_PATH is set.
+hsctl_has() { PATH="${HSCTL_PATH:-$PATH}" command -v "$1" >/dev/null 2>&1; }
+if hsctl_has jq || hsctl_has python3; then DECODER=1; else DECODER=; fi
+skip() { printf '  skip %s (%s)\n' "$1" "$2"; }
 ok()   { pass=$((pass + 1)); printf '  ok   %s\n' "$1"; }
 bad()  { fail=$((fail + 1)); printf '  FAIL %s\n' "$1"; [ -n "${2:-}" ] && printf '       %s\n' "$2"; }
 # hsctl is invoked through an external wrapper, never a shell function: in
@@ -118,6 +122,12 @@ out="$("$RUN" preauthkeys create --user asik --expiration soon 2>&1)"; rc=$?
 out="$("$RUN" preauthkeys list 2>&1)"; rc=$?
 [ $rc -eq 0 ] && echo "$out" | grep -q "42" && echo "$out" | grep -q "asik" \
 	&& ok "preauthkeys list shows id and user" || bad "preauthkeys list shows id and user" "rc=$rc out=$out"
+# Columns: id user reusable ephemeral used expiration aclTags
+row="$(echo "$out" | awk '$1 == "42" {print $3 "|" $4 "|" $5 "|" $6}')"
+if [ -z "$DECODER" ]; then skip "preauthkeys list puts each value in its column" "raw JSON without jq/python3"
+else [ "$row" = "true|false|false|2027-01-07T00:00:00Z" ] \
+	&& ok "preauthkeys list puts each value in its column" \
+	|| bad "preauthkeys list puts each value in its column" "row=$row out=$out"; fi
 
 "$RUN" preauthkeys expire 42 >/dev/null 2>&1; rc=$?
 [ $rc -eq 0 ] && [ "$(req_field 'r["method"]+" "+r["path"]+" "+str(r["body"]["id"])')" = "POST /api/v1/preauthkey/expire 42" ] \
@@ -126,6 +136,16 @@ out="$("$RUN" preauthkeys list 2>&1)"; rc=$?
 out="$("$RUN" nodes list 2>&1)"; rc=$?
 [ $rc -eq 0 ] && echo "$out" | grep -q "axt1800" && echo "$out" | grep -q "100.64.0.44" \
 	&& ok "nodes list shows name and IP" || bad "nodes list shows name and IP" "rc=$rc out=$out"
+# Columns: id givenName user ipAddresses online approvedRoutes
+row="$(echo "$out" | awk '$2 == "nas" {print $5 "|" $6}')"
+if [ -z "$DECODER" ]; then skip "false booleans print as 'false' and columns stay aligned" "raw JSON without jq/python3"
+else [ "$row" = "false|10.0.0.90/32" ] \
+	&& ok "false booleans print as 'false' and columns stay aligned" \
+	|| bad "false booleans print as 'false' and columns stay aligned" "nas row online|routes=$row out=$out"; fi
+row="$(echo "$out" | awk '$1 == "9" {print NF "|" $6}')"
+if [ -z "$DECODER" ]; then skip "empty route list still fills its column" "raw JSON without jq/python3"
+else [ "$row" = "6|-" ] && ok "empty route list still fills its column" \
+	|| bad "empty route list still fills its column" "fields|routes=$row"; fi
 
 out="$("$RUN" users list 2>&1)"; rc=$?
 [ $rc -eq 0 ] && echo "$out" | grep -q "asik" && echo "$out" | grep -q "guest" \
@@ -340,7 +360,7 @@ out="$(XDG_CONFIG_HOME="$TMP/config-tty" python3 -I "$HERE/tty_interrupt.py" "$S
 
 # Non-ASCII arrives as \uXXXX. jq/python decode it; the sed-only path (OpenWrt)
 # cannot, so it must at least be unambiguous rather than look like raw JSON.
-if [ -n "${HSCTL_PATH:-}" ]; then want='m\[U+00[Ff][Cc]\]ller'; else want='müller'; fi
+if [ -n "$DECODER" ]; then want='müller'; else want='m\[U+00[Ff][Cc]\]ller'; fi
 out="$(HSCTL_BACKEND=mint HEADSCALE_MINT_TOKEN=test-mint-token-456 "$RUN" nodes list 2>&1)"
 echo "$out" | grep -q "$want" && ! echo "$out" | grep -q 'u00fc' \
 	&& ok "non-ASCII node names render (decoded, or [U+XXXX] without jq/python)" \

@@ -245,14 +245,17 @@ resolve_user() {
 }
 
 # table ARRAY_FIELD COLUMNS...: pretty-print a JSON list from stdin.
-# Columns are dotted paths; list values are comma-joined. Raw JSON without jq/python3.
+# Columns are dotted paths; list values are comma-joined. Missing, empty and
+# empty-list values print as "-": column -t merges empty cells, which slides
+# every later value into the wrong column. Raw JSON without jq/python3.
 table() {
 	field="$1"
 	shift
 	if command -v jq >/dev/null 2>&1; then
 		cols=""
+		# Not jq's "//": it treats false like null, so false would print blank.
 		for c in "$@"; do
-			cols="$cols${cols:+, }(.$c | if type == \"array\" then join(\",\") else (. // \"\" | tostring) end)"
+			cols="$cols${cols:+, }(.$c | if type == \"array\" then (if length == 0 then \"-\" else join(\",\") end) elif . == null or . == \"\" then \"-\" else tostring end)"
 		done
 		rows="$(printf '%s\n' "$*" | tr ' ' '\t'; jq -r ".${field}[]? | [$cols] | @tsv")" || exit 1
 		# Sanitise before column so alignment is computed on what is printed.
@@ -271,8 +274,10 @@ def get(o, path):
     for p in path.split("."):
         o = o.get(p) if isinstance(o, dict) else None
     if isinstance(o, list):
-        return ",".join(map(str, o))
-    return "" if o is None else str(o).lower() if isinstance(o, bool) else str(o)
+        return ",".join(map(str, o)) or "-"
+    if isinstance(o, bool):
+        return str(o).lower()
+    return "-" if o is None or o == "" else str(o)
 rows = [cols] + [[get(r, c) for c in cols] for r in json.load(sys.stdin).get(field) or []]
 w = [max(len(r[i]) for r in rows) for i in range(len(cols))]
 for r in rows:

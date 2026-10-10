@@ -106,6 +106,11 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": "9", "givenName": EVIL_NAME, "user": USERS[0],
                  "ipAddresses": ["100.64.0.9"], "online": True,
                  "approvedRoutes": []},
+                # Offline node with a route: a blank "online" cell must not
+                # let the route slide left into that column.
+                {"id": "4", "givenName": "nas", "user": USERS[0],
+                 "ipAddresses": ["100.64.0.4"], "online": False,
+                 "approvedRoutes": ["10.0.0.90/32"]},
             ]})
         return self._send(404, {"code": 5, "message": "Not Found"})
 
